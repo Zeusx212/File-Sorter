@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.spec
+
+# PyInstaller build outputs
+build/
+dist/
+
+# Application history & user settings
+.file_sorter_history.json
+.media_sorter_history.json
+.bulk_renamer_history.json
+.file_sorter_settings.json
+
+# Environment & IDE
+.vscode/
+.idea/
+*.log
+venv/
+.env
