@@ -28,6 +28,7 @@ import os
 import re
 import shutil
 import threading
+import time
 import tkinter as tk
 import urllib.parse
 import urllib.request
@@ -43,7 +44,7 @@ import customtkinter as ctk
 # ═══════════════════════════════════════════════════════════════════════════
 
 APP_NAME = "File Sorter"
-APP_VERSION = "3.2"
+APP_VERSION = "3.2.1"
 SETTINGS_FILE = Path.home() / ".file_sorter_settings.json"
 HISTORY_FILENAME = ".file_sorter_history.json"
 MEDIA_HISTORY_FILENAME = ".media_sorter_history.json"
@@ -269,6 +270,75 @@ def sanitize_filename(name: str) -> str:
     s = re.sub(r"[:]", " -", name)
     s = re.sub(r'[<>"/\\|?*]', "", s)
     return re.sub(r"\s+", " ", s).strip()
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  HIGH-PERFORMANCE SAFE FILE SCANNER FOR LARGE DRIVES (1TB+ / 100K+ FILES)
+# ═══════════════════════════════════════════════════════════════════════════
+
+SKIP_DIRS = {
+    "$recycle.bin", "system volume information", "recovery", "$windows.~bt",
+    "$winreagent", "windows", "perflogs", "program files", "program files (x86)",
+    "appdata", ".git", "node_modules", ".cache"
+}
+
+def is_system_file(name: str) -> bool:
+    nl = name.lower()
+    return (
+        nl in (
+            "pagefile.sys", "swapfile.sys", "hiberfil.sys", "dumpstack.log.tmp",
+            "desktop.ini", "thumbs.db",
+            HISTORY_FILENAME.lower(), MEDIA_HISTORY_FILENAME.lower(), RENAMER_HISTORY_FILENAME.lower(),
+        )
+        or nl.startswith("$")
+    )
+
+def safe_iter_files(folder: str, recursive: bool = True, cancel_event: threading.Event | None = None):
+    """
+    Safely iterate files without crashing on Windows system/locked folders,
+    skipping protected/inaccessible directories, and checking cancellation.
+    Yields (entry_name, full_path, size_bytes).
+    """
+    folder = os.path.abspath(folder)
+    if not recursive:
+        try:
+            with os.scandir(folder) as it:
+                for entry in it:
+                    if cancel_event and cancel_event.is_set():
+                        return
+                    try:
+                        if entry.is_file(follow_symlinks=False):
+                            if is_system_file(entry.name):
+                                continue
+                            try:
+                                sz = entry.stat().st_size
+                            except OSError:
+                                sz = 0
+                            yield entry.name, entry.path, sz
+                    except (PermissionError, OSError):
+                        continue
+        except (PermissionError, OSError):
+            return
+        return
+
+    for root, dirs, files in os.walk(folder, topdown=True, onerror=lambda e: None):
+        if cancel_event and cancel_event.is_set():
+            return
+        # In-place directory pruning
+        dirs[:] = [
+            d for d in dirs
+            if d.lower() not in SKIP_DIRS and not d.startswith("$") and not d.startswith(".")
+        ]
+        for fname in files:
+            if cancel_event and cancel_event.is_set():
+                return
+            if is_system_file(fname):
+                continue
+            full_path = os.path.join(root, fname)
+            try:
+                sz = os.path.getsize(full_path)
+            except OSError:
+                sz = 0
+            yield fname, full_path, sz
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -559,23 +629,31 @@ def scan_media_folder(
     create_season_folders: bool = True,
     structure_by_type: bool = True,
     progress_cb=None,
+    cancel_event: threading.Event | None = None,
 ) -> list[dict]:
     """Scan folder for video files and build destination paths with TVDB/Kitsu metadata."""
     folder_path = Path(folder)
-    iterator = folder_path.rglob("*") if recursive else folder_path.iterdir()
-    video_files: list[Path] = []
+    video_files: list[tuple[str, str, int]] = []
 
-    for item in iterator:
-        if not item.is_file() or item.name in (HISTORY_FILENAME, MEDIA_HISTORY_FILENAME):
-            continue
-        if item.suffix.lower() in VIDEO_EXTENSIONS:
-            video_files.append(item)
+    for name, full_path, size in safe_iter_files(folder, recursive=recursive, cancel_event=cancel_event):
+        if cancel_event and cancel_event.is_set():
+            break
+        if os.path.splitext(name)[1].lower() in VIDEO_EXTENSIONS:
+            video_files.append((name, full_path, size))
 
     total = len(video_files)
     plan: list[dict] = []
+    last_cb = 0.0
 
-    for i, file_path in enumerate(video_files):
-        parsed = parse_media_filename(file_path.name)
+    # Cache metadata queries by show name
+    tvdb_cache: dict[str, dict] = {}
+    anime_cache: dict[str, dict] = {}
+
+    for i, (fname, fpath, size) in enumerate(video_files):
+        if cancel_event and cancel_event.is_set():
+            break
+
+        parsed = parse_media_filename(fname)
         m_type = parsed["type"]
         title = parsed["title"]
         s_num = parsed["season"]
@@ -589,19 +667,19 @@ def scan_media_folder(
         # TV Show lookup
         if m_type == "TV Show":
             if fetch_tvdb:
-                show_data = fetch_show_data(title)
+                if title not in tvdb_cache:
+                    tvdb_cache[title] = fetch_show_data(title)
+                show_data = tvdb_cache[title]
                 official_show_title = show_data.get("name") or title
                 episodes = show_data.get("episodes", {})
                 ep_title = episodes.get((s_num, e_num), "")
 
-            # Format filename: Show Name - S01E02 - Episode Title.ext
             se_tag = f"S{s_num:02d}E{e_num:02d}"
             if ep_title:
                 new_filename = f"{official_show_title} - {se_tag} - {ep_title}{ext}"
             else:
                 new_filename = f"{official_show_title} - {se_tag}{ext}"
 
-            # Directory structure: [TV Shows /] Show Name / [Season 01 /] filename
             dir_parts = []
             if structure_by_type:
                 dir_parts.append("TV Shows")
@@ -615,14 +693,15 @@ def scan_media_folder(
         elif m_type == "Anime":
             is_absolute = parsed.get("is_absolute", False)
             if fetch_anime:
-                anime_data = fetch_anime_data(title)
+                if title not in anime_cache:
+                    anime_cache[title] = fetch_anime_data(title)
+                anime_data = anime_cache[title]
                 official_show_title = anime_data.get("name") or title
                 if anime_data.get("id"):
                     ep_title = fetch_anime_episode(anime_data["id"], e_num, anime_data)
                 else:
                     ep_title = anime_data.get("episodes", {}).get(e_num, "")
 
-            # Format filename
             if is_absolute or (s_num == 1 and e_num > 30):
                 tag = f"Ep {e_num:02d}" if e_num < 100 else f"Ep {e_num}"
             else:
@@ -633,7 +712,6 @@ def scan_media_folder(
             else:
                 new_filename = f"{official_show_title} - {tag}{ext}"
 
-            # Directory structure: [Anime /] Anime Title / [Season 01 /] filename
             dir_parts = []
             if structure_by_type:
                 dir_parts.append("Anime")
@@ -657,23 +735,15 @@ def scan_media_folder(
             dest_file = dest_dir / sanitize_filename(new_filename)
 
         else:
-            # Standalone video
             dir_parts = ["Videos"] if structure_by_type else []
             dest_dir = folder_path.joinpath(*dir_parts)
             dest_file = dest_dir / f"{title}{ext}"
 
         try:
-            size = file_path.stat().st_size
-        except OSError:
-            size = 0
-
-        # Relative destination display
-        try:
             rel_dest = str(dest_file.relative_to(folder_path))
         except Exception:
             rel_dest = str(dest_file)
 
-        # Formatted display tag
         if m_type == "TV Show":
             se_disp = f"S{s_num:02d}E{e_num:02d}"
         elif m_type == "Anime":
@@ -687,8 +757,8 @@ def scan_media_folder(
             se_disp = "-"
 
         plan.append({
-            "name": file_path.name,
-            "src": str(file_path),
+            "name": fname,
+            "src": fpath,
             "dest": str(dest_file),
             "rel_dest": rel_dest,
             "type": m_type,
@@ -699,7 +769,9 @@ def scan_media_folder(
             "selected": True,
         })
 
-        if progress_cb:
+        now = time.monotonic()
+        if progress_cb and (i == total - 1 or now - last_cb >= 0.05):
+            last_cb = now
             progress_cb(i + 1, total)
 
     plan.sort(key=lambda x: (x["type"], x["title"], x["name"].lower()))
@@ -710,36 +782,45 @@ def execute_media_sort(plan: list[dict], folder: str, progress_cb=None) -> list[
     selected = [e for e in plan if e.get("selected", True)]
     history: list[dict] = []
     total = len(selected)
+    last_cb = 0.0
 
     for i, entry in enumerate(selected):
         dest_path = Path(entry["dest"])
-        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            dest_path.parent.mkdir(parents=True, exist_ok=True)
+            final_dest = dest_path
+            if final_dest.exists() and str(final_dest) != entry["src"]:
+                stem = final_dest.stem
+                ext = final_dest.suffix
+                counter = 1
+                while final_dest.exists():
+                    final_dest = dest_path.parent / f"{stem} ({counter}){ext}"
+                    counter += 1
 
-        # Handle collisions
-        final_dest = dest_path
-        if final_dest.exists() and str(final_dest) != entry["src"]:
-            stem = final_dest.stem
-            ext = final_dest.suffix
-            counter = 1
-            while final_dest.exists():
-                final_dest = dest_path.parent / f"{stem} ({counter}){ext}"
-                counter += 1
+            shutil.move(entry["src"], str(final_dest))
+            history.append({"src": entry["src"], "dest": str(final_dest)})
+        except (OSError, PermissionError, shutil.Error):
+            pass
 
-        shutil.move(entry["src"], str(final_dest))
-        history.append({"src": entry["src"], "dest": str(final_dest)})
-        if progress_cb:
+        now = time.monotonic()
+        if progress_cb and (i == total - 1 or now - last_cb >= 0.05):
+            last_cb = now
             progress_cb(i + 1, total)
 
-    history_file = Path(folder) / MEDIA_HISTORY_FILENAME
-    record = {"timestamp": datetime.datetime.now().isoformat(), "moves": history}
-    all_records = []
-    if history_file.exists():
+    if history:
+        history_file = Path(folder) / MEDIA_HISTORY_FILENAME
+        record = {"timestamp": datetime.datetime.now().isoformat(), "moves": history}
+        all_records = []
+        if history_file.exists():
+            try:
+                all_records = json.loads(history_file.read_text(encoding="utf-8"))
+            except Exception:
+                all_records = []
+        all_records.append(record)
         try:
-            all_records = json.loads(history_file.read_text(encoding="utf-8"))
+            history_file.write_text(json.dumps(all_records, indent=2), encoding="utf-8")
         except Exception:
-            all_records = []
-    all_records.append(record)
-    history_file.write_text(json.dumps(all_records, indent=2), encoding="utf-8")
+            pass
     return history
 
 
@@ -758,35 +839,39 @@ def undo_media_sort(folder: str, progress_cb=None) -> int:
     moves = last.get("moves", [])
     total = len(moves)
     restored = 0
+    last_cb = 0.0
 
     for i, entry in enumerate(moves):
         dest_file = Path(entry["dest"])
         src_file = Path(entry["src"])
-        if dest_file.exists():
-            src_file.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(dest_file), str(src_file))
-            restored += 1
-            # Clean up empty parent directories
-            parent = dest_file.parent
-            while parent != Path(folder):
-                try:
-                    parent.rmdir()
-                    parent = parent.parent
-                except OSError:
-                    break
-        if progress_cb:
+        try:
+            if dest_file.exists():
+                src_file.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(dest_file), str(src_file))
+                restored += 1
+                parent = dest_file.parent
+                while parent != Path(folder):
+                    try:
+                        parent.rmdir()
+                        parent = parent.parent
+                    except OSError:
+                        break
+        except (OSError, PermissionError, shutil.Error):
+            pass
+
+        now = time.monotonic()
+        if progress_cb and (i == total - 1 or now - last_cb >= 0.05):
+            last_cb = now
             progress_cb(i + 1, total)
 
-    if all_records:
-        history_file.write_text(json.dumps(all_records, indent=2), encoding="utf-8")
-    else:
-        history_file.unlink(missing_ok=True)
+    try:
+        if all_records:
+            history_file.write_text(json.dumps(all_records, indent=2), encoding="utf-8")
+        else:
+            history_file.unlink(missing_ok=True)
+    except Exception:
+        pass
     return restored
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  GENERAL FILE SORTER LOGIC
-# ═══════════════════════════════════════════════════════════════════════════
 
 def build_ext_map(categories: dict[str, list[str]]) -> dict[str, str]:
     m: dict[str, str] = {}
@@ -801,20 +886,20 @@ def scan_general_folder(
     ext_map: dict[str, str],
     recursive: bool = False,
     sort_uncategorised_to_misc: bool = False,
+    progress_cb=None,
+    cancel_event: threading.Event | None = None,
 ) -> list[dict]:
     plan: list[dict] = []
     folder_path = Path(folder)
+    seen_hashes: dict[tuple[str, int], str] = {}
+    count = 0
+    last_report_time = 0.0
 
-    iterator = folder_path.rglob("*") if recursive else folder_path.iterdir()
-    seen_hashes: dict[str, str] = {}
+    for name, full_path, size in safe_iter_files(folder, recursive=recursive, cancel_event=cancel_event):
+        if cancel_event and cancel_event.is_set():
+            break
 
-    for item in iterator:
-        if not item.is_file() or item.name in (HISTORY_FILENAME, MEDIA_HISTORY_FILENAME):
-            continue
-        if not recursive and item.parent != folder_path:
-            continue
-
-        ext = item.suffix.lower()
+        ext = os.path.splitext(name)[1].lower()
         category = ext_map.get(ext)
         if not category:
             if sort_uncategorised_to_misc:
@@ -822,28 +907,30 @@ def scan_general_folder(
             else:
                 continue
 
-        try:
-            size = item.stat().st_size
-        except OSError:
-            size = 0
-
-        fh = file_hash(item)
-        is_dup = fh in seen_hashes
-        dup_of = seen_hashes.get(fh, "")
+        count += 1
+        key = (name.lower(), size)
+        is_dup = key in seen_hashes
+        dup_of = seen_hashes.get(key, "")
         if not is_dup:
-            seen_hashes[fh] = item.name
+            seen_hashes[key] = name
 
         dest_dir = folder_path / category
         plan.append({
-            "name": item.name,
-            "src": str(item),
-            "dest": str(dest_dir / item.name),
+            "name": name,
+            "src": full_path,
+            "dest": str(dest_dir / name),
             "category": category,
             "size": size,
             "duplicate": is_dup,
             "duplicate_of": dup_of,
             "selected": True,
         })
+
+        if progress_cb:
+            now = time.monotonic()
+            if count % 200 == 0 or now - last_report_time >= 0.15:
+                last_report_time = now
+                progress_cb(count)
 
     plan.sort(key=lambda x: (x["category"], x["name"].lower()))
     return plan
@@ -853,33 +940,44 @@ def execute_general_sort(plan: list[dict], folder: str, progress_cb=None) -> lis
     selected = [e for e in plan if e.get("selected", True)]
     history: list[dict] = []
     total = len(selected)
+    last_cb = 0.0
 
     for i, entry in enumerate(selected):
         dest_dir = str(Path(entry["dest"]).parent)
-        os.makedirs(dest_dir, exist_ok=True)
-        final_dest = entry["dest"]
-        if os.path.exists(final_dest):
-            stem = Path(entry["name"]).stem
-            ext = Path(entry["name"]).suffix
-            counter = 1
-            while os.path.exists(final_dest):
-                final_dest = str(Path(dest_dir) / f"{stem} ({counter}){ext}")
-                counter += 1
-        shutil.move(entry["src"], final_dest)
-        history.append({"src": entry["src"], "dest": final_dest})
-        if progress_cb:
+        try:
+            os.makedirs(dest_dir, exist_ok=True)
+            final_dest = entry["dest"]
+            if os.path.exists(final_dest):
+                stem = Path(entry["name"]).stem
+                ext = Path(entry["name"]).suffix
+                counter = 1
+                while os.path.exists(final_dest):
+                    final_dest = str(Path(dest_dir) / f"{stem} ({counter}){ext}")
+                    counter += 1
+            shutil.move(entry["src"], final_dest)
+            history.append({"src": entry["src"], "dest": final_dest})
+        except (OSError, PermissionError, shutil.Error):
+            pass
+
+        now = time.monotonic()
+        if progress_cb and (i == total - 1 or now - last_cb >= 0.05):
+            last_cb = now
             progress_cb(i + 1, total)
 
-    history_path = Path(folder) / HISTORY_FILENAME
-    record = {"timestamp": datetime.datetime.now().isoformat(), "moves": history}
-    all_records = []
-    if history_path.exists():
+    if history:
+        history_path = Path(folder) / HISTORY_FILENAME
+        record = {"timestamp": datetime.datetime.now().isoformat(), "moves": history}
+        all_records = []
+        if history_path.exists():
+            try:
+                all_records = json.loads(history_path.read_text(encoding="utf-8"))
+            except Exception:
+                all_records = []
+        all_records.append(record)
         try:
-            all_records = json.loads(history_path.read_text(encoding="utf-8"))
+            history_path.write_text(json.dumps(all_records, indent=2), encoding="utf-8")
         except Exception:
-            all_records = []
-    all_records.append(record)
-    history_path.write_text(json.dumps(all_records, indent=2), encoding="utf-8")
+            pass
     return history
 
 
@@ -898,31 +996,36 @@ def undo_general_sort(folder: str, progress_cb=None) -> int:
     moves = last.get("moves", [])
     total = len(moves)
     restored = 0
+    last_cb = 0.0
 
     for i, entry in enumerate(moves):
         dest_file = Path(entry["dest"])
         src_file = Path(entry["src"])
-        if dest_file.exists():
-            src_file.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(dest_file), str(src_file))
-            restored += 1
-            try:
-                dest_file.parent.rmdir()
-            except OSError:
-                pass
-        if progress_cb:
+        try:
+            if dest_file.exists():
+                src_file.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(dest_file), str(src_file))
+                restored += 1
+                try:
+                    dest_file.parent.rmdir()
+                except OSError:
+                    pass
+        except (OSError, PermissionError, shutil.Error):
+            pass
+
+        now = time.monotonic()
+        if progress_cb and (i == total - 1 or now - last_cb >= 0.05):
+            last_cb = now
             progress_cb(i + 1, total)
 
-    if all_records:
-        history_path.write_text(json.dumps(all_records, indent=2), encoding="utf-8")
-    else:
-        history_path.unlink(missing_ok=True)
+    try:
+        if all_records:
+            history_path.write_text(json.dumps(all_records, indent=2), encoding="utf-8")
+        else:
+            history_path.unlink(missing_ok=True)
+    except Exception:
+        pass
     return restored
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  BULK FILE RENAMER LOGIC
-# ═══════════════════════════════════════════════════════════════════════════
 
 def apply_rename_rules(filename: str, idx: int, rules: dict) -> str:
     """Compute new filename by applying search/replace, casing, numbering, etc."""
@@ -999,44 +1102,50 @@ def apply_rename_rules(filename: str, idx: int, rules: dict) -> str:
     return sanitize_filename(stem) + ext
 
 
-def scan_renamer_folder(folder: str, recursive: bool = False, rules: dict | None = None) -> list[dict]:
+def scan_renamer_folder(
+    folder: str,
+    recursive: bool = False,
+    rules: dict | None = None,
+    progress_cb=None,
+    cancel_event: threading.Event | None = None,
+) -> list[dict]:
     """Scan folder for files and compute preview of renamed files based on active rules."""
-    folder_path = Path(folder)
-    iterator = folder_path.rglob("*") if recursive else folder_path.iterdir()
     plan: list[dict] = []
     active_rules = rules or {}
+    raw_files: list[tuple[str, str, int]] = []
+    count = 0
+    last_report_time = 0.0
 
-    file_list: list[Path] = []
-    for item in iterator:
-        if not item.is_file() or item.name in (HISTORY_FILENAME, MEDIA_HISTORY_FILENAME, RENAMER_HISTORY_FILENAME):
-            continue
-        file_list.append(item)
+    for name, full_path, size in safe_iter_files(folder, recursive=recursive, cancel_event=cancel_event):
+        if cancel_event and cancel_event.is_set():
+            break
+        raw_files.append((name, full_path, size))
+        count += 1
+        if progress_cb:
+            now = time.monotonic()
+            if count % 200 == 0 or now - last_report_time >= 0.15:
+                last_report_time = now
+                progress_cb(count)
 
-    file_list.sort(key=lambda x: x.name.lower())
-
+    raw_files.sort(key=lambda x: x[0].lower())
     seen_new_names: dict[str, int] = defaultdict(int)
 
-    for idx, item in enumerate(file_list):
-        new_name = apply_rename_rules(item.name, idx, active_rules) if active_rules else item.name
-        try:
-            size = item.stat().st_size
-        except OSError:
-            size = 0
-
-        changed = (new_name != item.name)
+    for idx, (name, full_path, size) in enumerate(raw_files):
+        new_name = apply_rename_rules(name, idx, active_rules) if active_rules else name
+        changed = (new_name != name)
         status = "Pending"
-        dest_path = item.parent / new_name
+        dest_path = Path(full_path).parent / new_name
 
         seen_new_names[str(dest_path).lower()] += 1
         if seen_new_names[str(dest_path).lower()] > 1:
             status = "Duplicate Name"
-        elif dest_path.exists() and str(dest_path) != str(item):
+        elif dest_path.exists() and str(dest_path) != full_path:
             status = "Target Exists"
 
         plan.append({
-            "name": item.name,
+            "name": name,
             "new_name": new_name,
-            "src": str(item),
+            "src": full_path,
             "dest": str(dest_path),
             "size": size,
             "changed": changed,
@@ -1074,27 +1183,41 @@ def execute_bulk_rename(plan: list[dict], folder: str, progress_cb=None) -> list
 
     # Pass 1: rename to temp
     for entry, src_path, temp_dest, final_dest in temp_moves:
-        if src_path.exists():
-            os.rename(str(src_path), str(temp_dest))
+        try:
+            if src_path.exists():
+                os.rename(str(src_path), str(temp_dest))
+        except (OSError, PermissionError):
+            pass
 
     # Pass 2: rename from temp to final
+    last_cb = 0.0
     for i, (entry, src_path, temp_dest, final_dest) in enumerate(temp_moves):
-        if temp_dest.exists():
-            os.rename(str(temp_dest), str(final_dest))
-            history.append({"src": str(src_path), "dest": str(final_dest)})
-        if progress_cb:
+        try:
+            if temp_dest.exists():
+                os.rename(str(temp_dest), str(final_dest))
+                history.append({"src": str(src_path), "dest": str(final_dest)})
+        except (OSError, PermissionError):
+            pass
+
+        now = time.monotonic()
+        if progress_cb and (i == total - 1 or now - last_cb >= 0.05):
+            last_cb = now
             progress_cb(i + 1, total)
 
-    history_file = Path(folder) / RENAMER_HISTORY_FILENAME
-    record = {"timestamp": datetime.datetime.now().isoformat(), "moves": history}
-    all_records = []
-    if history_file.exists():
+    if history:
+        history_file = Path(folder) / RENAMER_HISTORY_FILENAME
+        record = {"timestamp": datetime.datetime.now().isoformat(), "moves": history}
+        all_records = []
+        if history_file.exists():
+            try:
+                all_records = json.loads(history_file.read_text(encoding="utf-8"))
+            except Exception:
+                all_records = []
+        all_records.append(record)
         try:
-            all_records = json.loads(history_file.read_text(encoding="utf-8"))
+            history_file.write_text(json.dumps(all_records, indent=2), encoding="utf-8")
         except Exception:
-            all_records = []
-    all_records.append(record)
-    history_file.write_text(json.dumps(all_records, indent=2), encoding="utf-8")
+            pass
     return history
 
 
@@ -1114,35 +1237,31 @@ def undo_bulk_rename(folder: str, progress_cb=None) -> int:
     moves = last.get("moves", [])
     total = len(moves)
     restored = 0
+    last_cb = 0.0
 
     for i, entry in enumerate(reversed(moves)):
         dest_file = Path(entry["dest"])
         src_file = Path(entry["src"])
-        if dest_file.exists():
-            src_file.parent.mkdir(parents=True, exist_ok=True)
-            final_src = src_file
-            if final_src.exists() and str(final_src) != str(dest_file):
-                stem = final_src.stem
-                ext = final_src.suffix
-                c = 1
-                while final_src.exists():
-                    final_src = src_file.parent / f"{stem} ({c}){ext}"
-                    c += 1
-            os.rename(str(dest_file), str(final_src))
-            restored += 1
-        if progress_cb:
+        try:
+            if dest_file.exists():
+                os.rename(str(dest_file), str(src_file))
+                restored += 1
+        except (OSError, PermissionError):
+            pass
+
+        now = time.monotonic()
+        if progress_cb and (i == total - 1 or now - last_cb >= 0.05):
+            last_cb = now
             progress_cb(i + 1, total)
 
-    if all_records:
-        history_file.write_text(json.dumps(all_records, indent=2), encoding="utf-8")
-    else:
-        history_file.unlink(missing_ok=True)
+    try:
+        if all_records:
+            history_file.write_text(json.dumps(all_records, indent=2), encoding="utf-8")
+        else:
+            history_file.unlink(missing_ok=True)
+    except Exception:
+        pass
     return restored
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  SETTINGS PERSISTENCE
-# ═══════════════════════════════════════════════════════════════════════════
 
 def load_settings() -> dict:
     defaults = {
@@ -1230,6 +1349,26 @@ class FileSorterApp(ctk.CTk):
 
         self._is_busy = False
 
+        # Pagination & Large Drive Virtualization State
+        self.general_page = 1
+        self.general_page_size = 100
+        self.general_filtered_plan: list[dict] = []
+        self._general_scanning = False
+        self._general_scan_cancel = threading.Event()
+
+        self.media_page = 1
+        self.media_page_size = 100
+        self.media_filtered_plan: list[dict] = []
+        self._media_scanning = False
+        self._media_scan_cancel = threading.Event()
+
+        self.renamer_page = 1
+        self.renamer_page_size = 100
+        self.renamer_filtered_plan: list[dict] = []
+        self._renamer_scanning = False
+        self._renamer_scan_cancel = threading.Event()
+        self._renamer_debounce_id = None
+
         # Pillow Antialiased Sun / Moon Icons
         self._sun_icon = ctk.CTkImage(
             light_image=_create_sun_icon(18, (255, 255, 255)),
@@ -1291,6 +1430,10 @@ class FileSorterApp(ctk.CTk):
             if self.current_renamer_plan:
                 self._populate_renamer_table(self.current_renamer_plan)
 
+
+    def _get_cat_color(self, category: str) -> str:
+        idx = abs(hash(category)) % len(CHART_COLORS)
+        return CHART_COLORS[idx]
     def _toggle_theme(self):
         self._theme = "light" if self._theme == "dark" else "dark"
         self._apply_theme()
@@ -1869,6 +2012,63 @@ class FileSorterApp(ctk.CTk):
             font=_font(14), text_color=T["text_dim"],
         ).pack(pady=80)
 
+        # General Pagination Bar (Row 2 in table_card)
+        self.gen_pag_bar = ctk.CTkFrame(table_card, fg_color=T["card_alt"], corner_radius=6, height=36)
+        self.gen_pag_bar.grid(row=2, column=0, sticky="ew", padx=2, pady=2)
+        self.gen_pag_bar.pack_propagate(False)
+
+        self.gen_btn_first = ctk.CTkButton(
+            self.gen_pag_bar, text="⏮ First", width=55, height=26, font=_font(11),
+            fg_color=T["btn_primary"], hover_color=T["btn_primary_hover"], command=self._gen_page_first,
+        )
+        self.gen_btn_first.pack(side="left", padx=(6, 2), pady=5)
+
+        self.gen_btn_prev = ctk.CTkButton(
+            self.gen_pag_bar, text="◀ Prev", width=55, height=26, font=_font(11),
+            fg_color=T["btn_primary"], hover_color=T["btn_primary_hover"], command=self._gen_page_prev,
+        )
+        self.gen_btn_prev.pack(side="left", padx=2, pady=5)
+
+        self.gen_page_label = ctk.CTkLabel(
+            self.gen_pag_bar, text="Page 1 of 1 (0 files)", font=_font(11, "bold"), text_color=T["text"],
+        )
+        self.gen_page_label.pack(side="left", padx=10, pady=5)
+
+        self.gen_size_menu = ctk.CTkOptionMenu(
+            self.gen_pag_bar, values=["50", "100", "250", "500"], width=72, height=26, font=_font(11),
+            fg_color=T["card"], button_color=T["btn_primary"], button_hover_color=T["btn_primary_hover"],
+            dropdown_fg_color=T["card"], command=self._gen_change_page_size,
+        )
+        self.gen_size_menu.set(str(self.general_page_size))
+        self.gen_size_menu.pack(side="right", padx=(2, 6), pady=5)
+
+        ctk.CTkLabel(self.gen_pag_bar, text="Per page:", font=_font(11), text_color=T["text_dim"]).pack(side="right", padx=2, pady=5)
+
+        self.gen_btn_last = ctk.CTkButton(
+            self.gen_pag_bar, text="Last ⏭", width=55, height=26, font=_font(11),
+            fg_color=T["btn_primary"], hover_color=T["btn_primary_hover"], command=self._gen_page_last,
+        )
+        self.gen_btn_last.pack(side="right", padx=2, pady=5)
+
+        self.gen_btn_next = ctk.CTkButton(
+            self.gen_pag_bar, text="Next ▶", width=55, height=26, font=_font(11),
+            fg_color=T["btn_primary"], hover_color=T["btn_primary_hover"], command=self._gen_page_next,
+        )
+        self.gen_btn_next.pack(side="right", padx=2, pady=5)
+
+        self.gen_btn_go = ctk.CTkButton(
+            self.gen_pag_bar, text="Go", width=34, height=26, font=_font(11),
+            fg_color=T["btn_primary"], hover_color=T["btn_primary_hover"], command=self._gen_page_jump,
+        )
+        self.gen_btn_go.pack(side="right", padx=(2, 6), pady=5)
+
+        self.gen_page_entry = ctk.CTkEntry(self.gen_pag_bar, width=42, height=26, font=_font(11), justify="center")
+        self.gen_page_entry.insert(0, "1")
+        self.gen_page_entry.pack(side="right", padx=2, pady=5)
+        self.gen_page_entry.bind("<Return>", lambda _: self._gen_page_jump())
+
+        ctk.CTkLabel(self.gen_pag_bar, text="Go:", font=_font(11), text_color=T["text_dim"]).pack(side="right", padx=2, pady=5)
+
         # Status Bar
         status_bar = ctk.CTkFrame(parent, fg_color=T["card"], corner_radius=6,
                                   height=28, border_width=1, border_color=T["border"])
@@ -2029,6 +2229,63 @@ class FileSorterApp(ctk.CTk):
             text='Select a media folder above and click "Scan Media" to preview TV shows & movies.',
             font=_font(14), text_color=T["text_dim"],
         ).pack(pady=80)
+
+        # Media Pagination Bar (Row 2 in media_table_card)
+        self.media_pag_bar = ctk.CTkFrame(media_table_card, fg_color=T["card_alt"], corner_radius=6, height=36)
+        self.media_pag_bar.grid(row=2, column=0, sticky="ew", padx=2, pady=2)
+        self.media_pag_bar.pack_propagate(False)
+
+        self.med_btn_first = ctk.CTkButton(
+            self.media_pag_bar, text="⏮ First", width=55, height=26, font=_font(11),
+            fg_color=T["btn_primary"], hover_color=T["btn_primary_hover"], command=self._med_page_first,
+        )
+        self.med_btn_first.pack(side="left", padx=(6, 2), pady=5)
+
+        self.med_btn_prev = ctk.CTkButton(
+            self.media_pag_bar, text="◀ Prev", width=55, height=26, font=_font(11),
+            fg_color=T["btn_primary"], hover_color=T["btn_primary_hover"], command=self._med_page_prev,
+        )
+        self.med_btn_prev.pack(side="left", padx=2, pady=5)
+
+        self.med_page_label = ctk.CTkLabel(
+            self.media_pag_bar, text="Page 1 of 1 (0 files)", font=_font(11, "bold"), text_color=T["text"],
+        )
+        self.med_page_label.pack(side="left", padx=10, pady=5)
+
+        self.med_size_menu = ctk.CTkOptionMenu(
+            self.media_pag_bar, values=["50", "100", "250", "500"], width=72, height=26, font=_font(11),
+            fg_color=T["card"], button_color=T["btn_primary"], button_hover_color=T["btn_primary_hover"],
+            dropdown_fg_color=T["card"], command=self._med_change_page_size,
+        )
+        self.med_size_menu.set(str(self.media_page_size))
+        self.med_size_menu.pack(side="right", padx=(2, 6), pady=5)
+
+        ctk.CTkLabel(self.media_pag_bar, text="Per page:", font=_font(11), text_color=T["text_dim"]).pack(side="right", padx=2, pady=5)
+
+        self.med_btn_last = ctk.CTkButton(
+            self.media_pag_bar, text="Last ⏭", width=55, height=26, font=_font(11),
+            fg_color=T["btn_primary"], hover_color=T["btn_primary_hover"], command=self._med_page_last,
+        )
+        self.med_btn_last.pack(side="right", padx=2, pady=5)
+
+        self.med_btn_next = ctk.CTkButton(
+            self.media_pag_bar, text="Next ▶", width=55, height=26, font=_font(11),
+            fg_color=T["btn_primary"], hover_color=T["btn_primary_hover"], command=self._med_page_next,
+        )
+        self.med_btn_next.pack(side="right", padx=2, pady=5)
+
+        self.med_btn_go = ctk.CTkButton(
+            self.media_pag_bar, text="Go", width=34, height=26, font=_font(11),
+            fg_color=T["btn_primary"], hover_color=T["btn_primary_hover"], command=self._med_page_jump,
+        )
+        self.med_btn_go.pack(side="right", padx=(2, 6), pady=5)
+
+        self.med_page_entry = ctk.CTkEntry(self.media_pag_bar, width=42, height=26, font=_font(11), justify="center")
+        self.med_page_entry.insert(0, "1")
+        self.med_page_entry.pack(side="right", padx=2, pady=5)
+        self.med_page_entry.bind("<Return>", lambda _: self._med_page_jump())
+
+        ctk.CTkLabel(self.media_pag_bar, text="Go:", font=_font(11), text_color=T["text_dim"]).pack(side="right", padx=2, pady=5)
 
         # Media Status Bar
         media_status_bar = ctk.CTkFrame(parent, fg_color=T["card"], corner_radius=6,
@@ -2255,6 +2512,63 @@ class FileSorterApp(ctk.CTk):
             font=_font(14), text_color=T["text_dim"],
         ).pack(pady=80)
 
+        # Renamer Pagination Bar (Row 2 in renamer_table_card)
+        self.renamer_pag_bar = ctk.CTkFrame(renamer_table_card, fg_color=T["card_alt"], corner_radius=6, height=36)
+        self.renamer_pag_bar.grid(row=2, column=0, sticky="ew", padx=2, pady=2)
+        self.renamer_pag_bar.pack_propagate(False)
+
+        self.ren_btn_first = ctk.CTkButton(
+            self.renamer_pag_bar, text="⏮ First", width=55, height=26, font=_font(11),
+            fg_color=T["btn_primary"], hover_color=T["btn_primary_hover"], command=self._ren_page_first,
+        )
+        self.ren_btn_first.pack(side="left", padx=(6, 2), pady=5)
+
+        self.ren_btn_prev = ctk.CTkButton(
+            self.renamer_pag_bar, text="◀ Prev", width=55, height=26, font=_font(11),
+            fg_color=T["btn_primary"], hover_color=T["btn_primary_hover"], command=self._ren_page_prev,
+        )
+        self.ren_btn_prev.pack(side="left", padx=2, pady=5)
+
+        self.ren_page_label = ctk.CTkLabel(
+            self.renamer_pag_bar, text="Page 1 of 1 (0 files)", font=_font(11, "bold"), text_color=T["text"],
+        )
+        self.ren_page_label.pack(side="left", padx=10, pady=5)
+
+        self.ren_size_menu = ctk.CTkOptionMenu(
+            self.renamer_pag_bar, values=["50", "100", "250", "500"], width=72, height=26, font=_font(11),
+            fg_color=T["card"], button_color=T["btn_primary"], button_hover_color=T["btn_primary_hover"],
+            dropdown_fg_color=T["card"], command=self._ren_change_page_size,
+        )
+        self.ren_size_menu.set(str(self.renamer_page_size))
+        self.ren_size_menu.pack(side="right", padx=(2, 6), pady=5)
+
+        ctk.CTkLabel(self.renamer_pag_bar, text="Per page:", font=_font(11), text_color=T["text_dim"]).pack(side="right", padx=2, pady=5)
+
+        self.ren_btn_last = ctk.CTkButton(
+            self.renamer_pag_bar, text="Last ⏭", width=55, height=26, font=_font(11),
+            fg_color=T["btn_primary"], hover_color=T["btn_primary_hover"], command=self._ren_page_last,
+        )
+        self.ren_btn_last.pack(side="right", padx=2, pady=5)
+
+        self.ren_btn_next = ctk.CTkButton(
+            self.renamer_pag_bar, text="Next ▶", width=55, height=26, font=_font(11),
+            fg_color=T["btn_primary"], hover_color=T["btn_primary_hover"], command=self._ren_page_next,
+        )
+        self.ren_btn_next.pack(side="right", padx=2, pady=5)
+
+        self.ren_btn_go = ctk.CTkButton(
+            self.renamer_pag_bar, text="Go", width=34, height=26, font=_font(11),
+            fg_color=T["btn_primary"], hover_color=T["btn_primary_hover"], command=self._ren_page_jump,
+        )
+        self.ren_btn_go.pack(side="right", padx=(2, 6), pady=5)
+
+        self.ren_page_entry = ctk.CTkEntry(self.renamer_pag_bar, width=42, height=26, font=_font(11), justify="center")
+        self.ren_page_entry.insert(0, "1")
+        self.ren_page_entry.pack(side="right", padx=2, pady=5)
+        self.ren_page_entry.bind("<Return>", lambda _: self._ren_page_jump())
+
+        ctk.CTkLabel(self.renamer_pag_bar, text="Go:", font=_font(11), text_color=T["text_dim"]).pack(side="right", padx=2, pady=5)
+
         # Renamer Status Bar (Row 5)
         renamer_status_bar = ctk.CTkFrame(parent, fg_color=T["card"], corner_radius=6,
                                           height=28, border_width=1, border_color=T["border"])
@@ -2286,11 +2600,18 @@ class FileSorterApp(ctk.CTk):
             self._scan_media()
 
     def _scan_media(self):
+        if hasattr(self, "_media_scanning") and self._media_scanning:
+            self.media_status.configure(text="Cancelling scan...")
+            self._media_scan_cancel.set()
+            return
+
         if not self.current_media_folder or self._is_busy:
             return
 
         self._is_busy = True
-        self._set_btn_state(self.media_scan_btn, False, self.T["card_alt"])
+        self._media_scanning = True
+        self._media_scan_cancel.clear()
+        self.media_scan_btn.configure(text="✕ Cancel", fg_color=self.T["danger"], hover_color=self.T["danger_hover"], state="normal")
         self._set_btn_state(self.media_sort_btn, False, self.T["card_alt"])
         self.media_status.configure(text="Scanning video files and querying TV & Anime Databases...")
         self.media_progress.set(0)
@@ -2304,7 +2625,8 @@ class FileSorterApp(ctk.CTk):
                     fetch_anime=self.media_anime_var.get(),
                     create_season_folders=self.media_season_var.get(),
                     structure_by_type=self.media_struct_var.get(),
-                    progress_cb=lambda c, t: self.after(0, self.media_progress.set, c / max(t, 1)),
+                    progress_cb=lambda c, t: self.after(0, lambda curr=c, tot=t: self._update_media_progress(curr, tot)),
+                    cancel_event=self._media_scan_cancel,
                 )
                 self.after(0, self._scan_media_done, plan, None)
             except Exception as exc:
@@ -2312,9 +2634,14 @@ class FileSorterApp(ctk.CTk):
 
         threading.Thread(target=_worker, daemon=True).start()
 
+    def _update_media_progress(self, current: int, total: int):
+        self.media_progress.set(current / max(total, 1))
+        self.media_status.configure(text=f"Scanning media ({current:,}/{total:,})...")
+
     def _scan_media_done(self, plan: list[dict], error: str | None):
         self._is_busy = False
-        self._set_btn_state(self.media_scan_btn, True, self.T["btn_primary"])
+        self._media_scanning = False
+        self.media_scan_btn.configure(text="Scan Media", fg_color=self.T["btn_primary"], hover_color=self.T["accent_hover"], state="normal")
         self.media_progress.set(0)
 
         if error:
@@ -2323,7 +2650,9 @@ class FileSorterApp(ctk.CTk):
             return
 
         self.current_media_plan = plan
-        self._populate_media_table(plan)
+        self.media_filtered_plan = list(plan)
+        self.media_page = 1
+        self._populate_media_table()
         self._update_media_count()
 
         anime_count = sum(1 for e in plan if e["type"] == "Anime")
@@ -2333,35 +2662,54 @@ class FileSorterApp(ctk.CTk):
 
         summary_parts = []
         if anime_count:
-            summary_parts.append(f"{anime_count} Anime Episode{'s' if anime_count != 1 else ''}")
+            summary_parts.append(f"{anime_count:,} Anime Episode{'s' if anime_count != 1 else ''}")
         if tv_count:
-            summary_parts.append(f"{tv_count} TV Episode{'s' if tv_count != 1 else ''}")
+            summary_parts.append(f"{tv_count:,} TV Episode{'s' if tv_count != 1 else ''}")
         if movie_count:
-            summary_parts.append(f"{movie_count} Movie{'s' if movie_count != 1 else ''}")
+            summary_parts.append(f"{movie_count:,} Movie{'s' if movie_count != 1 else ''}")
         if other_count:
-            summary_parts.append(f"{other_count} Video{'s' if other_count != 1 else ''}")
+            summary_parts.append(f"{other_count:,} Video{'s' if other_count != 1 else ''}")
 
         summary_text = " • ".join(summary_parts) if summary_parts else "No video files found"
         self.media_info_label.configure(text=summary_text)
-        self.media_status.configure(text=f"Scan complete — {len(plan)} files identified")
+        self.media_status.configure(text=f"Scan complete — {len(plan):,} files identified")
 
-    def _populate_media_table(self, plan: list[dict]):
+    def _populate_media_table(self, plan: list[dict] | None = None):
+        if plan is not None:
+            self.media_filtered_plan = plan
+
+        active = self.media_filtered_plan
+        total_items = len(active)
+        page_size = self.media_page_size
+        total_pages = max(1, math.ceil(total_items / page_size)) if total_items > 0 else 1
+
+        if self.media_page > total_pages:
+            self.media_page = total_pages
+        if self.media_page < 1:
+            self.media_page = 1
+
+        start_idx = (self.media_page - 1) * page_size
+        end_idx = min(start_idx + page_size, total_items)
+        page_items = active[start_idx:end_idx]
+
+        self._update_med_pag_controls(total_items, total_pages, start_idx, end_idx)
+
         T = self.T
         for w in self.media_table_body.winfo_children():
             w.destroy()
         self._media_check_vars.clear()
 
-        if not plan:
+        if not page_items:
+            msg = "No video files found." if total_items == 0 else "No items on this page."
             ctk.CTkLabel(
                 self.media_table_body,
-                text="No video files found in this folder.",
-                font=_font(14), text_color=T["text_dim"],
+                text=msg, font=_font(14), text_color=T["text_dim"],
             ).pack(pady=80)
             return
 
         col_w = {col[0]: col[1] for col in MEDIA_TABLE_COLS}
 
-        for idx, entry in enumerate(plan):
+        for idx, entry in enumerate(page_items):
             bg = T["row_even"] if idx % 2 == 0 else T["row_odd"]
             row = ctk.CTkFrame(self.media_table_body, fg_color=bg, corner_radius=0, height=32)
             row.pack(fill="x")
@@ -2370,8 +2718,7 @@ class FileSorterApp(ctk.CTk):
             # Checkbox
             var = tk.BooleanVar(value=entry.get("selected", True))
             self._media_check_vars.append(var)
-            cb_idx = idx
-            var.trace_add("write", lambda *_, i=cb_idx, v=var: self._on_media_check(i, v))
+            var.trace_add("write", lambda *_, e=entry, v=var: self._on_media_entry_check(e, v))
             ctk.CTkCheckBox(
                 row, text="", variable=var, width=col_w[""],
                 fg_color=T["btn_primary"], hover_color=T["btn_primary_hover"],
@@ -2431,33 +2778,90 @@ class FileSorterApp(ctk.CTk):
                 font=_font(12), text_color=T["text_dim"], anchor="w",
             ).pack(side="left", padx=4)
 
+    def _update_med_pag_controls(self, total_items: int, total_pages: int, start_idx: int, end_idx: int):
+        T = self.T
+        can_prev = self.media_page > 1
+        can_next = self.media_page < total_pages
+
+        self._set_btn_state(self.med_btn_first, can_prev, T["btn_primary"])
+        self._set_btn_state(self.med_btn_prev, can_prev, T["btn_primary"])
+        self._set_btn_state(self.med_btn_next, can_next, T["btn_primary"])
+        self._set_btn_state(self.med_btn_last, can_next, T["btn_primary"])
+
+        if total_items == 0:
+            self.med_page_label.configure(text="Page 0 of 0 (0 files)")
+        else:
+            self.med_page_label.configure(
+                text=f"Page {self.media_page} of {total_pages} (Showing {start_idx+1:,}–{end_idx:,} of {total_items:,} files)"
+            )
+        self.med_page_entry.delete(0, "end")
+        self.med_page_entry.insert(0, str(self.media_page))
+
+    def _med_page_first(self):
+        self.media_page = 1
+        self._populate_media_table()
+
+    def _med_page_prev(self):
+        if self.media_page > 1:
+            self.media_page -= 1
+            self._populate_media_table()
+
+    def _med_page_next(self):
+        total_pages = max(1, math.ceil(len(self.media_filtered_plan) / self.media_page_size))
+        if self.media_page < total_pages:
+            self.media_page += 1
+            self._populate_media_table()
+
+    def _med_page_last(self):
+        total_pages = max(1, math.ceil(len(self.media_filtered_plan) / self.media_page_size))
+        self.media_page = total_pages
+        self._populate_media_table()
+
+    def _med_page_jump(self):
+        val = self.med_page_entry.get().strip()
+        if not val.isdigit():
+            return
+        page = int(val)
+        total_pages = max(1, math.ceil(len(self.media_filtered_plan) / self.media_page_size))
+        self.media_page = max(1, min(page, total_pages))
+        self._populate_media_table()
+
+    def _med_change_page_size(self, val: str):
+        try:
+            self.media_page_size = int(val)
+        except ValueError:
+            self.media_page_size = 100
+        self.media_page = 1
+        self._populate_media_table()
+
     def _filter_media_table(self):
         query = self.media_search_var.get().lower().strip()
         if not query:
-            self._populate_media_table(self.current_media_plan)
-            return
-        filtered = [
-            e for e in self.current_media_plan
-            if query in e["name"].lower() or query in e["title"].lower() or query in e["ep_title"].lower() or query in e["type"].lower()
-        ]
-        self._populate_media_table(filtered)
+            self.media_filtered_plan = list(self.current_media_plan)
+        else:
+            self.media_filtered_plan = [
+                e for e in self.current_media_plan
+                if query in e["name"].lower() or query in e["title"].lower() or query in e["ep_title"].lower() or query in e["type"].lower()
+            ]
+        self.media_page = 1
+        self._populate_media_table()
 
-    def _on_media_check(self, idx: int, var: tk.BooleanVar):
-        if idx < len(self.current_media_plan):
-            self.current_media_plan[idx]["selected"] = var.get()
+    def _on_media_entry_check(self, entry: dict, var: tk.BooleanVar):
+        entry["selected"] = var.get()
         self._update_media_count()
 
     def _toggle_all_media(self, state: bool):
-        for i, var in enumerate(self._media_check_vars):
+        target_list = self.media_filtered_plan if self.media_filtered_plan else self.current_media_plan
+        for e in target_list:
+            e["selected"] = state
+        for var in self._media_check_vars:
             var.set(state)
-            if i < len(self.current_media_plan):
-                self.current_media_plan[i]["selected"] = state
         self._update_media_count()
 
     def _update_media_count(self):
         sel = sum(1 for e in self.current_media_plan if e.get("selected", True))
         total = len(self.current_media_plan)
-        self.media_count_label.configure(text=f"{sel}/{total} media selected")
+        self.media_count_label.configure(text=f"{sel:,}/{total:,} media selected")
         self._set_btn_state(self.media_sort_btn, sel > 0, self.T["success"])
 
     def _sort_media(self):
@@ -2494,7 +2898,8 @@ class FileSorterApp(ctk.CTk):
 
     def _sort_media_done(self, error: str | None):
         self._is_busy = False
-        self._set_btn_state(self.media_scan_btn, True, self.T["btn_primary"])
+        self._media_scanning = False
+        self.media_scan_btn.configure(text="Scan Media", fg_color=self.T["btn_primary"], hover_color=self.T["accent_hover"], state="normal")
         self.media_progress.set(0)
 
         if error:
@@ -2530,6 +2935,26 @@ class FileSorterApp(ctk.CTk):
 
     def _undo_media_done(self, count: int, error: str | None):
         self._is_busy = False
+
+        # Pagination & Large Drive Virtualization State
+        self.general_page = 1
+        self.general_page_size = 100
+        self.general_filtered_plan: list[dict] = []
+        self._general_scanning = False
+        self._general_scan_cancel = threading.Event()
+
+        self.media_page = 1
+        self.media_page_size = 100
+        self.media_filtered_plan: list[dict] = []
+        self._media_scanning = False
+        self._media_scan_cancel = threading.Event()
+
+        self.renamer_page = 1
+        self.renamer_page_size = 100
+        self.renamer_filtered_plan: list[dict] = []
+        self._renamer_scanning = False
+        self._renamer_scan_cancel = threading.Event()
+        self._renamer_debounce_id = None
         self.media_progress.set(0)
         self._update_media_undo_state()
 
@@ -2593,20 +3018,68 @@ class FileSorterApp(ctk.CTk):
         }
 
     def _scan_renamer(self):
+        if hasattr(self, "_renamer_scanning") and self._renamer_scanning:
+            self.renamer_status.configure(text="Cancelling scan...")
+            self._renamer_scan_cancel.set()
+            return
+
         if not self.current_renamer_folder or self._is_busy:
             return
 
+        self._is_busy = True
+        self._renamer_scanning = True
+        self._renamer_scan_cancel.clear()
+        self.renamer_scan_btn.configure(text="✕ Cancel", fg_color=self.T["danger"], hover_color=self.T["danger_hover"], state="normal")
+        self._set_btn_state(self.renamer_apply_btn, False, self.T["card_alt"])
+        self.renamer_status.configure(text="Scanning folder for files...")
+        self.renamer_progress.set(0)
+
         rules = self._get_active_renamer_rules()
-        self.current_renamer_plan = scan_renamer_folder(
-            self.current_renamer_folder,
-            recursive=self.renamer_rec_var.get(),
-            rules=rules,
-        )
-        self._populate_renamer_table(self.current_renamer_plan)
+
+        def _worker():
+            try:
+                plan = scan_renamer_folder(
+                    self.current_renamer_folder,
+                    recursive=self.renamer_rec_var.get(),
+                    rules=rules,
+                    progress_cb=lambda count: self.after(0, lambda c=count: self.renamer_status.configure(text=f"Scanning... {c:,} files found")),
+                    cancel_event=self._renamer_scan_cancel,
+                )
+                self.after(0, self._scan_renamer_done, plan, None)
+            except Exception as exc:
+                self.after(0, self._scan_renamer_done, [], str(exc))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _scan_renamer_done(self, plan: list[dict], error: str | None):
+        self._is_busy = False
+        self._renamer_scanning = False
+        self.renamer_scan_btn.configure(text="Scan Files", fg_color=self.T["btn_primary"], hover_color=self.T["accent_hover"], state="normal")
+        self.renamer_progress.set(0)
+
+        if error:
+            self.renamer_status.configure(text=f"Scan error: {error}")
+            messagebox.showerror("Scan Failed", error)
+            return
+
+        self.current_renamer_plan = plan
+        self.renamer_filtered_plan = list(plan)
+        self.renamer_page = 1
+        self._populate_renamer_table()
         self._update_renamer_count()
         self._update_renamer_undo_state()
+        n = len(self.current_renamer_plan)
+        self.renamer_status.configure(text=f"Scan complete — {n:,} files identified")
 
     def _on_renamer_rule_change(self, *args):
+        if not self.current_renamer_plan:
+            return
+        if getattr(self, "_renamer_debounce_id", None):
+            self.after_cancel(self._renamer_debounce_id)
+        self._renamer_debounce_id = self.after(100, self._apply_renamer_rules_deferred)
+
+    def _apply_renamer_rules_deferred(self):
+        self._renamer_debounce_id = None
         if not self.current_renamer_plan:
             return
         rules = self._get_active_renamer_rules()
@@ -2632,23 +3105,42 @@ class FileSorterApp(ctk.CTk):
         self._filter_renamer_table()
         self._update_renamer_count()
 
-    def _populate_renamer_table(self, plan: list[dict]):
+    def _populate_renamer_table(self, plan: list[dict] | None = None):
+        if plan is not None:
+            self.renamer_filtered_plan = plan
+
+        active = self.renamer_filtered_plan
+        total_items = len(active)
+        page_size = self.renamer_page_size
+        total_pages = max(1, math.ceil(total_items / page_size)) if total_items > 0 else 1
+
+        if self.renamer_page > total_pages:
+            self.renamer_page = total_pages
+        if self.renamer_page < 1:
+            self.renamer_page = 1
+
+        start_idx = (self.renamer_page - 1) * page_size
+        end_idx = min(start_idx + page_size, total_items)
+        page_items = active[start_idx:end_idx]
+
+        self._update_ren_pag_controls(total_items, total_pages, start_idx, end_idx)
+
         T = self.T
         for w in self.renamer_table_body.winfo_children():
             w.destroy()
         self._renamer_check_vars.clear()
 
-        if not plan:
+        if not page_items:
+            msg = "Select a folder above and click 'Scan Files' to preview." if total_items == 0 else "No items on this page."
             ctk.CTkLabel(
                 self.renamer_table_body,
-                text='Select a folder above and click "Scan Files" to preview.',
-                font=_font(14), text_color=T["text_dim"],
+                text=msg, font=_font(14), text_color=T["text_dim"],
             ).pack(pady=80)
             return
 
         col_w = {col[0]: col[1] for col in RENAME_TABLE_COLS}
 
-        for idx, entry in enumerate(plan):
+        for idx, entry in enumerate(page_items):
             bg = T["row_even"] if idx % 2 == 0 else T["row_odd"]
             row = ctk.CTkFrame(self.renamer_table_body, fg_color=bg, corner_radius=0, height=32)
             row.pack(fill="x")
@@ -2657,8 +3149,7 @@ class FileSorterApp(ctk.CTk):
             # Checkbox
             var = tk.BooleanVar(value=entry.get("selected", True))
             self._renamer_check_vars.append(var)
-            cb_idx = idx
-            var.trace_add("write", lambda *_, i=cb_idx, v=var: self._on_renamer_check(i, v))
+            var.trace_add("write", lambda *_, e=entry, v=var: self._on_renamer_entry_check(e, v))
             ctk.CTkCheckBox(
                 row, text="", variable=var, width=col_w[""],
                 fg_color=T["btn_primary"], hover_color=T["btn_primary_hover"],
@@ -2674,26 +3165,25 @@ class FileSorterApp(ctk.CTk):
             # Size
             ctk.CTkLabel(
                 row, text=human_size(entry.get("size", 0)), width=col_w["Size"],
-                font=_font(12), text_color=T["text_muted"], anchor="w",
+                font=_font(12), text_color=T["text_dim"], anchor="w",
             ).pack(side="left", padx=4)
 
             # New Filename Preview
-            color = T["accent"] if entry["changed"] else T["text_dim"]
-            weight = "bold" if entry["changed"] else "normal"
+            preview_color = T["accent"] if entry["changed"] else T["text_muted"]
             ctk.CTkLabel(
                 row, text=entry["new_name"], width=col_w["New Filename Preview"],
-                font=_font(12, weight), text_color=color, anchor="w",
+                font=_font(12, "bold" if entry["changed"] else "normal"), text_color=preview_color, anchor="w",
             ).pack(side="left", padx=4)
 
             # Change badge
-            chg_frame = ctk.CTkFrame(row, fg_color="transparent", width=col_w["Change"])
-            chg_frame.pack(side="left", padx=4)
-            chg_frame.pack_propagate(False)
-            b_text = "Changed" if entry["changed"] else "Same"
-            b_color = T.get("badge_changed", "#0284c7") if entry["changed"] else T.get("badge_same", "#64748b")
+            badge_text = "MODIFIED" if entry["changed"] else "SAME"
+            badge_color = T["badge_changed"] if entry["changed"] else T["badge_same"]
+            change_frame = ctk.CTkFrame(row, fg_color="transparent", width=col_w["Change"])
+            change_frame.pack(side="left", padx=4)
+            change_frame.pack_propagate(False)
             ctk.CTkLabel(
-                chg_frame, text=f" {b_text} ", font=_font(10, "bold"),
-                fg_color=b_color, corner_radius=4, text_color="#ffffff", height=20,
+                change_frame, text=f" {badge_text} ", font=_font(10, "bold"),
+                fg_color=badge_color, corner_radius=4, text_color="#ffffff", height=20,
             ).pack(anchor="w", pady=5)
 
             # Status
@@ -2704,38 +3194,92 @@ class FileSorterApp(ctk.CTk):
                 text_color=stat_color, anchor="w",
             ).pack(side="left", padx=4)
 
+    def _update_ren_pag_controls(self, total_items: int, total_pages: int, start_idx: int, end_idx: int):
+        T = self.T
+        can_prev = self.renamer_page > 1
+        can_next = self.renamer_page < total_pages
+
+        self._set_btn_state(self.ren_btn_first, can_prev, T["btn_primary"])
+        self._set_btn_state(self.ren_btn_prev, can_prev, T["btn_primary"])
+        self._set_btn_state(self.ren_btn_next, can_next, T["btn_primary"])
+        self._set_btn_state(self.ren_btn_last, can_next, T["btn_primary"])
+
+        if total_items == 0:
+            self.ren_page_label.configure(text="Page 0 of 0 (0 files)")
+        else:
+            self.ren_page_label.configure(
+                text=f"Page {self.renamer_page} of {total_pages} (Showing {start_idx+1:,}–{end_idx:,} of {total_items:,} files)"
+            )
+        self.ren_page_entry.delete(0, "end")
+        self.ren_page_entry.insert(0, str(self.renamer_page))
+
+    def _ren_page_first(self):
+        self.renamer_page = 1
+        self._populate_renamer_table()
+
+    def _ren_page_prev(self):
+        if self.renamer_page > 1:
+            self.renamer_page -= 1
+            self._populate_renamer_table()
+
+    def _ren_page_next(self):
+        total_pages = max(1, math.ceil(len(self.renamer_filtered_plan) / self.renamer_page_size))
+        if self.renamer_page < total_pages:
+            self.renamer_page += 1
+            self._populate_renamer_table()
+
+    def _ren_page_last(self):
+        total_pages = max(1, math.ceil(len(self.renamer_filtered_plan) / self.renamer_page_size))
+        self.renamer_page = total_pages
+        self._populate_renamer_table()
+
+    def _ren_page_jump(self):
+        val = self.ren_page_entry.get().strip()
+        if not val.isdigit():
+            return
+        page = int(val)
+        total_pages = max(1, math.ceil(len(self.renamer_filtered_plan) / self.renamer_page_size))
+        self.renamer_page = max(1, min(page, total_pages))
+        self._populate_renamer_table()
+
+    def _ren_change_page_size(self, val: str):
+        try:
+            self.renamer_page_size = int(val)
+        except ValueError:
+            self.renamer_page_size = 100
+        self.renamer_page = 1
+        self._populate_renamer_table()
+
     def _filter_renamer_table(self):
         query = self.renamer_search_var.get().lower().strip()
         if not query:
-            self._populate_renamer_table(self.current_renamer_plan)
-            return
-        filtered = [
-            e for e in self.current_renamer_plan
-            if query in e["name"].lower() or query in e["new_name"].lower()
-        ]
-        self._populate_renamer_table(filtered)
+            self.renamer_filtered_plan = list(self.current_renamer_plan)
+        else:
+            self.renamer_filtered_plan = [
+                e for e in self.current_renamer_plan
+                if query in e["name"].lower() or query in e["new_name"].lower()
+            ]
+        self.renamer_page = 1
+        self._populate_renamer_table()
 
-    def _on_renamer_check(self, idx: int, var: tk.BooleanVar):
-        if idx < len(self.current_renamer_plan):
-            self.current_renamer_plan[idx]["selected"] = var.get()
+    def _on_renamer_entry_check(self, entry: dict, var: tk.BooleanVar):
+        entry["selected"] = var.get()
         self._update_renamer_count()
 
     def _toggle_all_renamer(self, state: bool):
-        for i, var in enumerate(self._renamer_check_vars):
+        target_list = self.renamer_filtered_plan if self.renamer_filtered_plan else self.current_renamer_plan
+        for e in target_list:
+            e["selected"] = state
+        for var in self._renamer_check_vars:
             var.set(state)
-            if i < len(self.current_renamer_plan):
-                self.current_renamer_plan[i]["selected"] = state
         self._update_renamer_count()
 
     def _update_renamer_count(self):
-        sel = sum(1 for e in self.current_renamer_plan if e.get("selected", True))
-        changed = sum(1 for e in self.current_renamer_plan if e.get("selected", True) and e.get("changed", False))
+        sel = sum(1 for e in self.current_renamer_plan if e.get("selected", True) and e.get("changed", False))
         total = len(self.current_renamer_plan)
-        self.renamer_count_label.configure(text=f"{sel}/{total} selected  •  {changed} to rename")
-        self._set_btn_state(self.renamer_rename_btn, changed > 0, self.T["success"])
-
-        self.renamer_info_label.configure(text=f"{changed} will change  •  {total - changed} unchanged")
-        self.renamer_status.configure(text=f"{total} files scanned")
+        changed_total = sum(1 for e in self.current_renamer_plan if e.get("changed", False))
+        self.renamer_count_label.configure(text=f"{sel:,} selected to rename (out of {changed_total:,} changed, {total:,} total)")
+        self._set_btn_state(self.renamer_apply_btn, sel > 0, self.T["btn_primary"])
 
     def _execute_rename(self):
         if self._is_busy or not self.current_renamer_plan or not self.current_renamer_folder:
@@ -2775,6 +3319,26 @@ class FileSorterApp(ctk.CTk):
 
     def _rename_done(self, count: int, error: str | None):
         self._is_busy = False
+
+        # Pagination & Large Drive Virtualization State
+        self.general_page = 1
+        self.general_page_size = 100
+        self.general_filtered_plan: list[dict] = []
+        self._general_scanning = False
+        self._general_scan_cancel = threading.Event()
+
+        self.media_page = 1
+        self.media_page_size = 100
+        self.media_filtered_plan: list[dict] = []
+        self._media_scanning = False
+        self._media_scan_cancel = threading.Event()
+
+        self.renamer_page = 1
+        self.renamer_page_size = 100
+        self.renamer_filtered_plan: list[dict] = []
+        self._renamer_scanning = False
+        self._renamer_scan_cancel = threading.Event()
+        self._renamer_debounce_id = None
         self._set_btn_state(self.renamer_scan_btn, True, self.T["btn_primary"])
         self.renamer_progress.set(0)
 
@@ -2811,6 +3375,26 @@ class FileSorterApp(ctk.CTk):
 
     def _undo_renamer_done(self, count: int, error: str | None):
         self._is_busy = False
+
+        # Pagination & Large Drive Virtualization State
+        self.general_page = 1
+        self.general_page_size = 100
+        self.general_filtered_plan: list[dict] = []
+        self._general_scanning = False
+        self._general_scan_cancel = threading.Event()
+
+        self.media_page = 1
+        self.media_page_size = 100
+        self.media_filtered_plan: list[dict] = []
+        self._media_scanning = False
+        self._media_scan_cancel = threading.Event()
+
+        self.renamer_page = 1
+        self.renamer_page_size = 100
+        self.renamer_filtered_plan: list[dict] = []
+        self._renamer_scanning = False
+        self._renamer_scan_cancel = threading.Event()
+        self._renamer_debounce_id = None
         self.renamer_progress.set(0)
         self._update_renamer_undo_state()
 
@@ -3123,53 +3707,104 @@ class FileSorterApp(ctk.CTk):
             self._scan_general()
 
     def _scan_general(self):
+        if hasattr(self, "_general_scanning") and self._general_scanning:
+            self.status.configure(text="Cancelling scan...")
+            self._general_scan_cancel.set()
+            return
+
         if not self.current_folder or self._is_busy:
             return
 
-        self.current_plan = scan_general_folder(
-            self.current_folder, self.ext_map,
-            recursive=self.recursive_var.get(),
-            sort_uncategorised_to_misc=self.misc_var.get(),
-        )
-        self._populate_file_table(self.current_plan)
+        self._is_busy = True
+        self._general_scanning = True
+        self._general_scan_cancel.clear()
+        self.scan_btn.configure(text="✕ Cancel", fg_color=self.T["danger"], hover_color=self.T["danger_hover"], state="normal")
+        self._set_btn_state(self.sort_btn, False, self.T["card_alt"])
+        self.status.configure(text="Scanning folder for files...")
+        self.progress.set(0)
+
+        def _worker():
+            try:
+                plan = scan_general_folder(
+                    self.current_folder, self.ext_map,
+                    recursive=self.recursive_var.get(),
+                    sort_uncategorised_to_misc=self.misc_var.get(),
+                    progress_cb=lambda count: self.after(0, lambda c=count: self.status.configure(text=f"Scanning... {c:,} files found")),
+                    cancel_event=self._general_scan_cancel,
+                )
+                self.after(0, self._scan_general_done, plan, None)
+            except Exception as exc:
+                self.after(0, self._scan_general_done, [], str(exc))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _scan_general_done(self, plan: list[dict], error: str | None):
+        self._is_busy = False
+        self._general_scanning = False
+        self.scan_btn.configure(text="Scan Files", fg_color=self.T["btn_primary"], hover_color=self.T["accent_hover"], state="normal")
+        self.progress.set(0)
+
+        if error:
+            self.status.configure(text=f"Scan error: {error}")
+            messagebox.showerror("Scan Failed", error)
+            return
+
+        self.current_plan = plan
+        self.general_filtered_plan = list(plan)
+        self.general_page = 1
+        self._populate_file_table()
         self._update_general_stats(self.current_plan)
         self._update_general_count()
         self._update_general_undo_state()
 
         dups = sum(1 for e in self.current_plan if e.get("duplicate"))
         if dups:
-            self.dup_label.configure(text=f"{dups} duplicate{'s' if dups != 1 else ''} found")
+            self.dup_label.configure(text=f"{dups:,} duplicate{'s' if dups != 1 else ''} found")
         else:
             self.dup_label.configure(text="")
 
         n = len(self.current_plan)
         if n > 0:
-            self.status.configure(text=f"Scan complete — {n} files identified")
+            self.status.configure(text=f"Scan complete — {n:,} files identified")
         else:
             self.status.configure(text="No sortable files in this folder")
 
-    def _populate_file_table(self, plan: list[dict]):
+    def _populate_file_table(self, plan: list[dict] | None = None):
+        if plan is not None:
+            self.general_filtered_plan = plan
+
+        active = self.general_filtered_plan
+        total_items = len(active)
+        page_size = self.general_page_size
+        total_pages = max(1, math.ceil(total_items / page_size)) if total_items > 0 else 1
+
+        if self.general_page > total_pages:
+            self.general_page = total_pages
+        if self.general_page < 1:
+            self.general_page = 1
+
+        start_idx = (self.general_page - 1) * page_size
+        end_idx = min(start_idx + page_size, total_items)
+        page_items = active[start_idx:end_idx]
+
+        self._update_gen_pag_controls(total_items, total_pages, start_idx, end_idx)
+
         T = self.T
         for w in self.table_body.winfo_children():
             w.destroy()
         self._check_vars.clear()
 
-        if not plan:
+        if not page_items:
+            msg = "No sortable files found in this folder." if total_items == 0 else "No items on this page."
             ctk.CTkLabel(
                 self.table_body,
-                text="No sortable files found in this folder.",
-                font=_font(14), text_color=T["text_dim"],
+                text=msg, font=_font(14), text_color=T["text_dim"],
             ).pack(pady=80)
             return
 
-        cat_colors = {}
-        cats_sorted = sorted({e["category"] for e in plan})
-        for i, cat in enumerate(cats_sorted):
-            cat_colors[cat] = CHART_COLORS[i % len(CHART_COLORS)]
-
         col_w = {col[0]: col[1] for col in FILE_TABLE_COLS}
 
-        for idx, entry in enumerate(plan):
+        for idx, entry in enumerate(page_items):
             bg = T["row_even"] if idx % 2 == 0 else T["row_odd"]
             row = ctk.CTkFrame(self.table_body, fg_color=bg, corner_radius=0, height=32)
             row.pack(fill="x")
@@ -3178,8 +3813,7 @@ class FileSorterApp(ctk.CTk):
             # Checkbox
             var = tk.BooleanVar(value=entry.get("selected", True))
             self._check_vars.append(var)
-            cb_idx = idx
-            var.trace_add("write", lambda *_, i=cb_idx, v=var: self._on_general_check(i, v))
+            var.trace_add("write", lambda *_, e=entry, v=var: self._on_general_entry_check(e, v))
             ctk.CTkCheckBox(
                 row, text="", variable=var, width=col_w[""],
                 fg_color=T["btn_primary"], hover_color=T["btn_primary_hover"],
@@ -3209,7 +3843,7 @@ class FileSorterApp(ctk.CTk):
             cat_frame = ctk.CTkFrame(row, fg_color="transparent", width=col_w["Target Category"])
             cat_frame.pack(side="left", padx=4)
             cat_frame.pack_propagate(False)
-            cat_color = cat_colors.get(entry["category"], T["btn_primary"])
+            cat_color = self._get_cat_color(entry["category"])
             ctk.CTkLabel(
                 cat_frame, text=f"  {entry['category']}  ", font=_font(11, "bold"),
                 fg_color=cat_color, corner_radius=5, text_color="#ffffff", height=22,
@@ -3229,25 +3863,84 @@ class FileSorterApp(ctk.CTk):
                 font=_font(12), text_color=T["text_dim"], anchor="w",
             ).pack(side="left", padx=4)
 
+    def _update_gen_pag_controls(self, total_items: int, total_pages: int, start_idx: int, end_idx: int):
+        T = self.T
+        can_prev = self.general_page > 1
+        can_next = self.general_page < total_pages
+
+        self._set_btn_state(self.gen_btn_first, can_prev, T["btn_primary"])
+        self._set_btn_state(self.gen_btn_prev, can_prev, T["btn_primary"])
+        self._set_btn_state(self.gen_btn_next, can_next, T["btn_primary"])
+        self._set_btn_state(self.gen_btn_last, can_next, T["btn_primary"])
+
+        if total_items == 0:
+            self.gen_page_label.configure(text="Page 0 of 0 (0 files)")
+        else:
+            self.gen_page_label.configure(
+                text=f"Page {self.general_page} of {total_pages} (Showing {start_idx+1:,}–{end_idx:,} of {total_items:,} files)"
+            )
+        self.gen_page_entry.delete(0, "end")
+        self.gen_page_entry.insert(0, str(self.general_page))
+
+    def _gen_page_first(self):
+        self.general_page = 1
+        self._populate_file_table()
+
+    def _gen_page_prev(self):
+        if self.general_page > 1:
+            self.general_page -= 1
+            self._populate_file_table()
+
+    def _gen_page_next(self):
+        total_pages = max(1, math.ceil(len(self.general_filtered_plan) / self.general_page_size))
+        if self.general_page < total_pages:
+            self.general_page += 1
+            self._populate_file_table()
+
+    def _gen_page_last(self):
+        total_pages = max(1, math.ceil(len(self.general_filtered_plan) / self.general_page_size))
+        self.general_page = total_pages
+        self._populate_file_table()
+
+    def _gen_page_jump(self):
+        val = self.gen_page_entry.get().strip()
+        if not val.isdigit():
+            return
+        page = int(val)
+        total_pages = max(1, math.ceil(len(self.general_filtered_plan) / self.general_page_size))
+        self.general_page = max(1, min(page, total_pages))
+        self._populate_file_table()
+
+    def _gen_change_page_size(self, val: str):
+        try:
+            self.general_page_size = int(val)
+        except ValueError:
+            self.general_page_size = 100
+        self.general_page = 1
+        self._populate_file_table()
+
     def _filter_general_table(self):
         query = self.search_var.get().lower().strip()
         if not query:
-            self._populate_file_table(self.current_plan)
-            return
-        filtered = [e for e in self.current_plan
-                    if query in e["name"].lower() or query in e["category"].lower()]
-        self._populate_file_table(filtered)
+            self.general_filtered_plan = list(self.current_plan)
+        else:
+            self.general_filtered_plan = [
+                e for e in self.current_plan
+                if query in e["name"].lower() or query in e["category"].lower()
+            ]
+        self.general_page = 1
+        self._populate_file_table()
 
-    def _on_general_check(self, idx: int, var: tk.BooleanVar):
-        if idx < len(self.current_plan):
-            self.current_plan[idx]["selected"] = var.get()
+    def _on_general_entry_check(self, entry: dict, var: tk.BooleanVar):
+        entry["selected"] = var.get()
         self._update_general_count()
 
     def _toggle_all_general(self, state: bool):
-        for i, var in enumerate(self._check_vars):
+        target_list = self.general_filtered_plan if self.general_filtered_plan else self.current_plan
+        for e in target_list:
+            e["selected"] = state
+        for var in self._check_vars:
             var.set(state)
-            if i < len(self.current_plan):
-                self.current_plan[i]["selected"] = state
         self._update_general_count()
 
     def _update_general_count(self):
@@ -3255,7 +3948,7 @@ class FileSorterApp(ctk.CTk):
         total = len(self.current_plan)
         cats = len({e["category"] for e in self.current_plan if e.get("selected", True)})
         self.count_label.configure(
-            text=f"{sel}/{total} selected  >  {cats} categor{'ies' if cats != 1 else 'y'}"
+            text=f"{sel:,}/{total:,} selected  •  {cats} categor{'ies' if cats != 1 else 'y'}"
         )
         self._set_btn_state(self.sort_btn, sel > 0, self.T["success"])
 
@@ -3281,7 +3974,7 @@ class FileSorterApp(ctk.CTk):
 
         for i, (cat, count) in enumerate(sorted_cats):
             pct = count / total * 100 if total else 0
-            color = CHART_COLORS[i % len(CHART_COLORS)]
+            color = self._get_cat_color(cat)
 
             row_frame = ctk.CTkFrame(self.stats_frame, fg_color="transparent")
             row_frame.pack(fill="x", pady=2)
@@ -3295,13 +3988,12 @@ class FileSorterApp(ctk.CTk):
             ).pack(side="left")
 
             ctk.CTkLabel(
-                label_row, text=f"{count} ({pct:.0f}%) | {human_size(cat_sizes[cat])}",
+                label_row, text=f"{count:,} ({pct:.0f}%) | {human_size(cat_sizes[cat])}",
                 font=_font(11), text_color=T["text_dim"], anchor="e",
             ).pack(side="right")
 
             bar_bg = ctk.CTkFrame(row_frame, height=6, fg_color=T["chart_bg"], corner_radius=3)
             bar_bg.pack(fill="x", pady=(2, 4))
-            bar_bg.update_idletasks()
 
             ctk.CTkFrame(
                 bar_bg, height=6, fg_color=color, corner_radius=3,
@@ -3341,6 +4033,26 @@ class FileSorterApp(ctk.CTk):
 
     def _sort_general_done(self, error: str | None):
         self._is_busy = False
+
+        # Pagination & Large Drive Virtualization State
+        self.general_page = 1
+        self.general_page_size = 100
+        self.general_filtered_plan: list[dict] = []
+        self._general_scanning = False
+        self._general_scan_cancel = threading.Event()
+
+        self.media_page = 1
+        self.media_page_size = 100
+        self.media_filtered_plan: list[dict] = []
+        self._media_scanning = False
+        self._media_scan_cancel = threading.Event()
+
+        self.renamer_page = 1
+        self.renamer_page_size = 100
+        self.renamer_filtered_plan: list[dict] = []
+        self._renamer_scanning = False
+        self._renamer_scan_cancel = threading.Event()
+        self._renamer_debounce_id = None
         self._set_btn_state(self.scan_btn, True, self.T["btn_primary"])
         self.progress.set(0)
 
@@ -3377,6 +4089,26 @@ class FileSorterApp(ctk.CTk):
 
     def _undo_general_done(self, count: int, error: str | None):
         self._is_busy = False
+
+        # Pagination & Large Drive Virtualization State
+        self.general_page = 1
+        self.general_page_size = 100
+        self.general_filtered_plan: list[dict] = []
+        self._general_scanning = False
+        self._general_scan_cancel = threading.Event()
+
+        self.media_page = 1
+        self.media_page_size = 100
+        self.media_filtered_plan: list[dict] = []
+        self._media_scanning = False
+        self._media_scan_cancel = threading.Event()
+
+        self.renamer_page = 1
+        self.renamer_page_size = 100
+        self.renamer_filtered_plan: list[dict] = []
+        self._renamer_scanning = False
+        self._renamer_scan_cancel = threading.Event()
+        self._renamer_debounce_id = None
         self.progress.set(0)
         self._update_general_undo_state()
 
